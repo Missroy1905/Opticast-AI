@@ -1,0 +1,28 @@
+#Core Deep Learning & Forecasting
+torch
+pytorch-lightning
+pytorch-forecasting
+mapie==0.8.0
+lightgbm
+
+#Web Backend & API
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+requests
+openmeteo-requests
+
+#Dashboard & Visualization
+streamlit
+plotly
+shap
+
+#Data Processing & Analysis
+pandas
+numpy
+scipy
+pyarrow
+
+#MLOps & Experiment Tracking 
+mlflow
