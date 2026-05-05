@@ -1,0 +1,4 @@
+-r base.txt
+openmeteo-requests
+pyarrow
+cdsapi

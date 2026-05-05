@@ -1,0 +1,118 @@
+version: "3.9"
+
+# ============================================================
+#  OptiCast AI - Phase 1 Docker Stack
+#  Services: TimescaleDB, pgAdmin (optional GUI), ingestion
+# ============================================================
+
+networks:
+  opticast_net:
+    driver: bridge
+
+volumes:
+  timescaledb_data:
+    driver: local
+
+services:
+
+  # ----------------------------------------------------------
+  # 1. TimescaleDB  (PostgreSQL 15 + TimescaleDB 2.x)
+  # ----------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: opticast_tsdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: opticast
+      POSTGRES_PASSWORD: opticast_secret   # TODO: change before production
+      POSTGRES_DB: opticast_db
+    ports:
+      - "5432:5432"                        # expose for local psql / DBeaver
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # auto-run on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opticast -d opticast_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - opticast_net
+
+  # ----------------------------------------------------------
+  # 2. pgAdmin  (optional browser-based SQL GUI)
+  #    Visit http://localhost:5050  →  login with PGADMIN creds below
+  # ----------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: opticast_pgadmin
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@opticast.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    networks:
+      - opticast_net
+
+      
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: opticast_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      # This is the magic key that replaces 'localhost'
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASS=${DB_PASS:-postgres}
+      - DB_NAME=${DB_NAME:-opticast}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - opticast_net
+
+
+  # ----------------------------------------------------------
+  # 3. Ingestion Service
+  #    Runs fetch + SCADA sim + DSM engine in sequence,
+  #    then exits (one-shot container, restart: on-failure
+  #    so Docker retries if DB isn't ready yet).
+  # ----------------------------------------------------------
+  ingestion:
+    build:
+      context: .
+      dockerfile: data/Dockerfile.ingestion
+    container_name: opticast_ingestion
+    restart: on-failure
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: opticast_db
+      DB_USER: opticast
+      DB_PASSWORD: opticast_secret
+      # ERA5 credentials - set your real CDS API key here or via .env file
+      CDS_URL: https://cds.climate.copernicus.eu/api/v2
+      CDS_KEY: ""          # leave blank to use mock ERA5 data
+    volumes:
+      - ./data:/app/data   # persist downloaded NetCDF / CSV files
+    networks:
+      - opticast_net
+
+# ============================================================
+#  Quick-start commands
+#  docker-compose up -d timescaledb          # DB only
+#  docker-compose up -d                      # full stack
+#  docker-compose run ingestion              # run ingestion manually
+# ============================================================

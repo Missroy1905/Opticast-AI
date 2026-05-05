@@ -1,0 +1,6 @@
+-r base.txt
+torch
+pytorch-forecasting
+mapie
+shap
+mlflow

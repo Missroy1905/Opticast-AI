@@ -1,0 +1,30 @@
+# ============================================================
+#  OptiCast AI — Ingestion Service Dockerfile
+#  File: Dockerfile.ingestion
+# ============================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for psycopg2, netCDF4, and numpy
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    libhdf5-dev \
+    libnetcdf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire requirements directory
+COPY requirements/ /app/requirements/
+
+# Install ONLY the Ingestion dependencies
+RUN pip install --no-cache-dir -r requirements/base.txt
+
+
+# Copy ingestion service
+COPY data/ingestion_service.py .
+
+# Data output directory
+RUN mkdir -p /app/data
+
+CMD ["python", "ingestion_service.py", "--service", "all"]
