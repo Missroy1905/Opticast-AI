@@ -9,6 +9,20 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+# ── Phase 2: DB wiring ──────────────────────────────────────
+# Load .env first so DB_HOST / DB_PASSWORD are set before db.py runs
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv optional — env vars may be set by Docker / shell
+
+try:
+    import db as _db
+    _DB_MODULE_OK = True
+except ImportError:
+    _DB_MODULE_OK = False   # db.py not found — full mock mode
+
 # ─────────────────────────────────────────────
 # PAGE CONFIG  (must be the first Streamlit call)
 # ─────────────────────────────────────────────
@@ -433,34 +447,31 @@ hr { border-color: var(--border) !important; }
 
 
 # ─────────────────────────────────────────────
-# MOCK DATA GENERATION
+# MOCK DATA GENERATION  (preserved as fallback)
 # ─────────────────────────────────────────────
 @st.cache_data
-def generate_forecast_data():
-    """24-hour Pavagada Solar Park forecast (MW)"""
+def _mock_forecast_data():
+    """24-hour Pavagada Solar Park forecast (MW) — deterministic mock."""
+    np.random.seed(42)
     hours = pd.date_range("2025-06-20 00:00", periods=97, freq="15min")
     t = np.linspace(0, 24, 97)
-
-    # Solar profile: zero at night, Gaussian peak at noon
     p50_raw = np.where(
         (t >= 6) & (t <= 18.5),
         420 * np.exp(-0.5 * ((t - 12.8) / 2.8) ** 2) + np.random.normal(0, 8, 97),
         np.random.normal(0, 1.5, 97)
     )
     p50 = np.clip(p50_raw, 0, None)
-
-    # Uncertainty bands widen mid-day
     uncertainty = 18 + 32 * np.exp(-0.5 * ((t - 12.8) / 3.5) ** 2)
     p10 = np.clip(p50 - uncertainty * 1.4, 0, None)
     p90 = p50 + uncertainty * 1.1
-
     df = pd.DataFrame({"timestamp": hours, "P10": p10, "P50": p50, "P90": p90})
     df["P10"] = df["P10"].clip(lower=0)
     return df
 
 @st.cache_data
-def generate_qca_schedule():
-    """96-block KERC QCA schedule"""
+def _mock_qca_schedule():
+    """96-block KERC QCA schedule — deterministic mock."""
+    np.random.seed(42)
     blocks = list(range(1, 97))
     base_time = datetime(2025, 6, 20, 0, 0)
     times = [(base_time + timedelta(minutes=15 * i)).strftime("%H:%M") for i in range(96)]
@@ -474,8 +485,7 @@ def generate_qca_schedule():
     actual = np.clip(actual, 0, None)
     deviation = actual - declared
     dsm_charge = np.where(np.abs(deviation) > 15, np.abs(deviation) * 0.02, 0.0)
-
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "Block": blocks,
         "Time Slot": times,
         "Declared (MW)": np.round(declared, 1),
@@ -484,11 +494,89 @@ def generate_qca_schedule():
         "DSM Charge (₹L)": np.round(dsm_charge, 3),
         "Status": ["⚠️ Ramp" if 13.5 <= t[i] <= 14.5 else ("✅ Normal" if abs(deviation[i]) < 15 else "🔴 Deviated") for i in range(96)]
     })
-    return df
 
-forecast_df = generate_forecast_data()
-qca_df = generate_qca_schedule()
+# ─────────────────────────────────────────────
+# PHASE 2 — SMART DATA LOADERS
+# Try DB first; silently fall back to mock data.
+# TTL=30s means the chart refreshes every 30s
+# when the DB is live without hammering it.
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=30, show_spinner=False)
+def load_forecast_data():
+    """Return forecast DataFrame from DB or mock."""
+    if _DB_MODULE_OK:
+        df = _db.load_forecast_df()
+        if df is not None and not df.empty:
+            # Normalise timestamps to tz-naive for Plotly compatibility
+            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+            return df, True          # (data, is_live)
+    return _mock_forecast_data(), False
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_qca_data():
+    """Return QCA DataFrame from DB or mock."""
+    if _DB_MODULE_OK:
+        df = _db.load_qca_df()
+        if df is not None and not df.empty:
+            return df, True
+    return _mock_qca_schedule(), False
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_kpi_data():
+    """Return live KPI metrics dict or None (UI uses hardcoded fallback)."""
+    if _DB_MODULE_OK:
+        return _db.load_kpi_metrics()
+    return None
+
+# ─────────────────────────────────────────────
+# AUTO-REFRESH  (15-minute block cadence)
+# ─────────────────────────────────────────────
+_REFRESH_INTERVAL_S = 30   # change to 900 for every-block refresh in production
+
+if "last_refresh" not in st.session_state:
+    st.session_state["last_refresh"] = datetime.now()
+
+_elapsed = (datetime.now() - st.session_state["last_refresh"]).total_seconds()
+if _elapsed > _REFRESH_INTERVAL_S:
+    st.session_state["last_refresh"] = datetime.now()
+    load_forecast_data.clear()
+    load_qca_data.clear()
+    load_kpi_data.clear()
+    st.rerun()
+
+# ─────────────────────────────────────────────
+# RESOLVE DATA  (used throughout the file)
+# ─────────────────────────────────────────────
+forecast_df, _forecast_live = load_forecast_data()
+qca_df,      _qca_live      = load_qca_data()
+_kpi                         = load_kpi_data()          # None when DB offline
+_db_live                     = _forecast_live or _qca_live
+
 now_str = datetime.now().strftime("%d %b %Y  •  %H:%M:%S IST")
+
+# ── Derive live KPI strings (fall back to hardcoded when _kpi is None) ──
+_dsm_str    = f"HIGH · ₹{_kpi['dsm_penalty_lakh']:.1f}L/hr" if _kpi else "HIGH · ₹12L/hr"
+_dsm_detail = (f"▼ {_kpi['non_compliant_blocks']} non-compliant blocks today"
+               if _kpi else "▼ Deviation >15MW · Block 58")
+_alerts_str = str(_kpi["active_alerts"]) + " Active" if _kpi else "1 Active"
+_cf_str     = f"{_kpi['capacity_factor_pct']:.1f}%" if _kpi else "38.7%"
+
+# ── Compliance summary for Tab 2 ──
+_comp_metrics = [
+    ("Total Declared Energy",       f"{_kpi['total_declared_mwh']:,.0f} MWh"  if _kpi else "4,312 MWh",  "#00d4ff"),
+    ("Total Actual Generation",     f"{_kpi['total_actual_mwh']:,.0f} MWh"    if _kpi else "4,289 MWh",  "#00d4ff"),
+    ("Net Deviation",               f"{_kpi['net_deviation_mwh']:+.0f} MWh"   if _kpi else "−23 MWh",    "#ff4d4d"),
+    ("Blocks with Deviation >15%",  f"{_kpi['non_compliant_blocks']} blocks"  if _kpi else "8 blocks",   "#f5a623"),
+    ("Estimated DSM Charge",        f"₹{_kpi['dsm_penalty_lakh']:.2f} Lakh"  if _kpi else "₹1.84 Lakh", "#ff4d4d"),
+    ("Compliance Score",            f"{_kpi['compliance_score_pct']:.1f}%"    if _kpi else "91.7%",      "#00e676"),
+] if _kpi else [
+    ("Total Declared Energy",  "4,312 MWh",  "#00d4ff"),
+    ("Total Actual Generation","4,289 MWh",  "#00d4ff"),
+    ("Net Deviation",          "−23 MWh",    "#ff4d4d"),
+    ("Blocks with Deviation >15MW", "8 blocks", "#f5a623"),
+    ("Estimated DSM Charge",   "₹1.84 Lakh", "#ff4d4d"),
+    ("Compliance Score",       "91.7%",      "#00e676"),
+]
 
 
 # ─────────────────────────────────────────────
@@ -510,12 +598,22 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Info bar
-st.markdown("""
+# Info bar — data source indicator wired to DB status
+_forecast_date_str = (
+    forecast_df["timestamp"].iloc[0].strftime("%d %b %Y")
+    if not forecast_df.empty and "timestamp" in forecast_df.columns
+    else "20 Jun 2025"
+)
+_data_src_label = (
+    '<span class="hi" style="color:#00e676">● LIVE DB</span>'
+    if _db_live else
+    '<span class="hi" style="color:#f5a623">● MOCK DATA</span>'
+)
+st.markdown(f"""
 <div class="info-bar">
-    <span>🗓 Forecast Date: <span class="hi">20 Jun 2025</span></span>
+    <span>🗓 Forecast Date: <span class="hi">{_forecast_date_str}</span></span>
     <span>🏭 Assets Online: <span class="hi">4 / 4</span></span>
-    <span>📡 Data Latency: <span class="hi">38 ms</span></span>
+    <span>📡 Data Source: {_data_src_label}</span>
     <span>🔁 Model: <span class="hi">OptiCast-v2.1-XGB</span></span>
     <span>🌐 Grid: <span class="hi">Southern Regional Grid · 220kV</span></span>
 </div>
@@ -537,29 +635,29 @@ with k1:
     </div>""", unsafe_allow_html=True)
 
 with k2:
-    st.markdown("""
+    st.markdown(f"""
     <div class="kpi-card red">
         <div class="kpi-icon">💸</div>
         <div class="kpi-label">Active DSM Penalty Risk</div>
-        <div class="kpi-value red" style="font-size:1.5rem;">HIGH · ₹12L/hr</div>
-        <div class="kpi-delta down">▼ Deviation &gt;15MW · Block 58</div>
+        <div class="kpi-value red" style="font-size:1.5rem;">{_dsm_str}</div>
+        <div class="kpi-delta down">{_dsm_detail}</div>
     </div>""", unsafe_allow_html=True)
 
 with k3:
-    st.markdown("""
+    st.markdown(f"""
     <div class="kpi-card amber">
         <div class="kpi-icon">🔔</div>
         <div class="kpi-label">Active Ramp Alerts</div>
-        <div class="kpi-value amber">1 Active</div>
+        <div class="kpi-value amber">{_alerts_str}</div>
         <div class="kpi-delta">Pavagada · 14:00 IST window</div>
     </div>""", unsafe_allow_html=True)
 
 with k4:
-    st.markdown("""
+    st.markdown(f"""
     <div class="kpi-card green">
         <div class="kpi-icon">☀️</div>
         <div class="kpi-label">Pavagada Capacity Factor</div>
-        <div class="kpi-value green">38.7%</div>
+        <div class="kpi-value green">{_cf_str}</div>
         <div class="kpi-delta up">▲ +2.1% vs 30-day avg</div>
     </div>""", unsafe_allow_html=True)
 
@@ -690,13 +788,14 @@ with tab1:
 
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        # Mini stat row below chart
+        # Mini stat row below chart — peak P50 pulled from live data
+        _peak_p50 = f"{forecast_df['P50'].max():.1f} MW" if not forecast_df.empty else "431.2 MW"
         s1, s2, s3, s4 = st.columns(4)
         for col, label, val, color in [
-            (s1, "Peak P50 Forecast", "431.2 MW", "#00d4ff"),
-            (s2, "Ramp Magnitude",    "−50 MW",   "#ff4d4d"),
-            (s3, "Sunrise / Sunset",  "06:07 / 18:43", "#f5a623"),
-            (s4, "GHI (avg today)",   "624 W/m²", "#00e676"),
+            (s1, "Peak P50 Forecast", _peak_p50,              "#00d4ff"),
+            (s2, "Ramp Magnitude",    "−50 MW",               "#ff4d4d"),
+            (s3, "Sunrise / Sunset",  "06:07 / 18:43",        "#f5a623"),
+            (s4, "GHI (avg today)",   "624 W/m²",             "#00e676"),
         ]:
             col.markdown(f"""
             <div style="background:#111d2e;border:1px solid #1e3a55;border-radius:5px;
@@ -806,7 +905,9 @@ with tab2:
 
         if generate_btn or st.session_state.get("qca_generated"):
             st.session_state["qca_generated"] = True
-            st.success("✅  QCA schedule generated successfully — Pavagada Solar Park · 20 Jun 2025 · Ready for KERC submission")
+            _src_label = "Live TimescaleDB" if _qca_live else "Mock Data"
+            st.success(f"✅  QCA schedule generated ({_src_label}) — Pavagada Solar Park · Ready for KERC submission")
+
             st.dataframe(
                 qca_df,
                 use_container_width=True,
@@ -822,6 +923,17 @@ with tab2:
                     "Status":         st.column_config.TextColumn("Status"),
                 },
             )
+
+            # ── One-click CSV download (KERC submission format) ──
+            _csv_bytes = qca_df.to_csv(index=False).encode("utf-8")
+            _csv_fname = f"KERC_QCA_PAVAGADA_{datetime.now().strftime('%Y%m%d')}.csv"
+            st.download_button(
+                label="📥  Download KERC QCA CSV",
+                data=_csv_bytes,
+                file_name=_csv_fname,
+                mime="text/csv",
+                use_container_width=False,
+            )
         else:
             st.markdown("""
             <div style="background:#111d2e;border:1px dashed #1e3a55;border-radius:6px;
@@ -834,14 +946,7 @@ with tab2:
     with col_right:
         st.markdown('<div class="section-title"><span class="dot"></span>DSM Compliance Summary</div>', unsafe_allow_html=True)
 
-        compliance_metrics = [
-            ("Total Declared Energy", "4,312 MWh", "#00d4ff"),
-            ("Total Actual Generation", "4,289 MWh", "#00d4ff"),
-            ("Net Deviation", "−23 MWh", "#ff4d4d"),
-            ("Blocks with Deviation >15MW", "8 blocks", "#f5a623"),
-            ("Estimated DSM Charge", "₹1.84 Lakh", "#ff4d4d"),
-            ("Compliance Score", "91.7%", "#00e676"),
-        ]
+        compliance_metrics = _comp_metrics
         for label, val, color in compliance_metrics:
             st.markdown(f"""
             <div style="display:flex;justify-content:space-between;align-items:center;
@@ -970,6 +1075,11 @@ with tab3:
 # FOOTER
 # ─────────────────────────────────────────────
 st.markdown("<div style='margin-top:2rem'></div>", unsafe_allow_html=True)
+_sys_status_label = (
+    '<span style="color:#00e676">SYSTEM NOMINAL &nbsp;·&nbsp; DB LIVE &nbsp;·&nbsp; ALL SERVICES OPERATIONAL</span>'
+    if _db_live else
+    '<span style="color:#f5a623">SYSTEM NOMINAL &nbsp;·&nbsp; MOCK DATA MODE &nbsp;·&nbsp; DB OFFLINE</span>'
+)
 st.markdown(f"""
 <div style="display:flex;justify-content:space-between;align-items:center;
              padding:.7rem 1rem;background:#0d1520;border:1px solid #1e3a55;
@@ -977,6 +1087,6 @@ st.markdown(f"""
              color:#1e3a55;flex-wrap:wrap;gap:.5rem">
     <span>OPTICAST AI &nbsp;·&nbsp; v2.1.4 &nbsp;·&nbsp; © 2025 KSPDCL Renewable Division</span>
     <span>KERC DSM REGULATIONS 2014 (AMENDED 2021) &nbsp;·&nbsp; QCA COMPLIANCE MODULE</span>
-    <span style="color:#00d4ff">SYSTEM NOMINAL &nbsp;·&nbsp; ALL SERVICES OPERATIONAL</span>
+    {_sys_status_label}
 </div>
 """, unsafe_allow_html=True)
