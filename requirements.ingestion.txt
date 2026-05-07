@@ -1,0 +1,18 @@
+# =============================================================================
+#  requirements.ingestion.txt  (FIXED)
+#  OptiCast AI — ERA5 Ingestion Worker dependencies
+#
+#  Fix: openmeteo-requests 0.3.0 does not exist on PyPI for Python 3.11.
+#       Updated to 1.7.5 (latest stable as of May 2026).
+#       retry-requests bumped to 2.0.0 to match the openmeteo-requests 1.x API.
+# =============================================================================
+
+requests==2.32.3
+pandas==2.2.0
+numpy==1.26.0
+pyarrow==16.0.0          # parquet read/write
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+openmeteo-requests==1.7.5   # FIX: was 0.3.0 — does not exist on PyPI
+retry-requests==2.0.0       # automatic retry wrapper for ERA5 API calls
+scipy==1.13.0

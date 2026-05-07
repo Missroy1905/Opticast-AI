@@ -1,0 +1,40 @@
+# =============================================================================
+#  OptiCast AI — Dockerfile.dashboard
+#  Streamlit mission-control UI (Phase 2 frontend)
+#  Pinned Python 3.11-slim for reproducibility and minimal attack surface.
+# =============================================================================
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps: curl for the healthcheck in docker-compose, libpq for psycopg2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies first (layer-cache friendly)
+COPY requirements.dashboard.txt .
+RUN pip install --no-cache-dir -r requirements.dashboard.txt
+
+# Copy application source
+# app.py and db.py are also bind-mounted at runtime (see docker-compose.yml)
+# so this COPY is a build-time fallback for air-gapped / immutable deploys.
+COPY app.py .
+COPY db.py .
+
+# Streamlit config baked into image so the container is self-contained
+# even without the bind-mount in production.
+RUN mkdir -p /app/.streamlit
+RUN echo '[server]\nheadless = true\nport = 8501\naddress = "0.0.0.0"\nenableCORS = false\n\n[browser]\ngatherUsageStats = false\n' \
+    > /app/.streamlit/config.toml
+
+EXPOSE 8501
+
+# Healthcheck mirrors the docker-compose definition — belt-and-suspenders.
+HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=5 \
+  CMD curl -sf http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

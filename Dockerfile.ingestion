@@ -1,0 +1,38 @@
+# =============================================================================
+#  OptiCast AI — Dockerfile.ingestion
+#  ERA5 fetch + SCADA simulation + DSM penalty data loader (one-shot worker)
+#  Pinned Python 3.11-slim. No web server — pure CLI script.
+# =============================================================================
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# libpq-dev + gcc required for psycopg2 build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY requirements.ingestion.txt .
+RUN pip install --no-cache-dir -r requirements.ingestion.txt
+
+# Copy the data pipeline scripts
+COPY data/ ./data/
+
+# Entrypoint runs all three pipeline stages in sequence:
+#   1. fetch_era5.py    — downloads ERA5 weather parquets via Open-Meteo API
+#   2. generate_scada.py — generates synthetic SCADA profiles with anomalies
+#   3. dsm_simulator.py  — simulates DSM penalty cycles for compliance testing
+#
+# Each script is idempotent: re-running only appends rows newer than the last
+# ingested timestamp (handled inside each script via upsert / ON CONFLICT).
+#
+# RUN_DATE env var (optional): pin to a specific date for backfill runs.
+#   e.g.  docker-compose run -e RUN_DATE=2024-06-15 --rm ingestion
+
+CMD ["sh", "-c", \
+     "python data/fetch_era5.py && \
+      python data/generate_scada.py && \
+      python data/dsm_simulator.py"]
