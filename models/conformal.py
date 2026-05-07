@@ -1,174 +1,105 @@
-"""
-models/conformal.py
--------------------
-MAPIE Conformal Prediction calibration layer for OptiCast AI.
-
-Adds a mathematically guaranteed 90% coverage interval on top of
-TFT's quantile regression outputs.
-
-Key property: the true generation value falls within the conformal band
-90% of the time — regardless of the underlying data distribution.
-This guarantee holds even during monsoon-onset distribution shifts
-where quantile regression alone breaks down.
-
-References:
-  arXiv:2602.02583 — Distribution-free CP for energy forecasting
-  arXiv:2510.15780 — Adaptive interval widths under weather shocks
-  arXiv:2502.04935 — CP under distribution shift
-"""
-
-import numpy as np
 import pandas as pd
-import json
-from pathlib import Path
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import glob
+import os
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.data.encoders import NaNLabelEncoder
+import warnings
 
-OUTPUT_DIR = Path(__file__).parent
+warnings.filterwarnings("ignore")
 
+def run_conformal():
+    print("1. Loading Data and Creating Splits...")
+    df = pd.read_parquet("/content/data/master_dataset.parquet")
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values(["plant_id", "time"]).reset_index(drop=True)
+    df["time_of_day"] = (df["time"].dt.hour + df["time"].dt.minute / 60.0) / 24.0
+    df["day_of_week"] = df["time"].dt.dayofweek / 6.0
+    df["time_idx"] = df.groupby("plant_id")["time"].transform(lambda s: (s - s.min()).dt.total_seconds() // 900).astype(int)
 
-def calibrate_conformal(
-    p50_preds: np.ndarray,
-    actuals:   np.ndarray,
-    alpha:     float = 0.10,
-) -> float:
-    """
-    Computes the conformal quantile from a held-out calibration set.
+    # Splitting: Train (80%), Calibration (10%), Test (10%)
+    max_idx = df["time_idx"].max()
+    train_df = df[df["time_idx"] < int(max_idx * 0.8)].copy()
+    cal_df = df[(df["time_idx"] >= int(max_idx * 0.8) - 96) & (df["time_idx"] < int(max_idx * 0.9))].copy()
+    test_df = df[df["time_idx"] >= int(max_idx * 0.9) - 96].copy()
 
-    Args:
-        p50_preds: P50 (median) forecasts on calibration set, shape (n,)
-        actuals:   True generation values,                   shape (n,)
-        alpha:     Miscoverage rate (0.10 = 90% coverage guarantee)
-
-    Returns:
-        conformal_q: scalar offset — add/subtract from P50 for guaranteed band
-    """
-    assert len(p50_preds) == len(actuals), "Prediction/actual length mismatch"
-    assert 0 < alpha < 1, "Alpha must be in (0, 1)"
-
-    # Non-conformity scores: absolute residuals
-    scores = np.abs(actuals - p50_preds)
-
-    # Distribution-free conformal quantile
-    n = len(scores)
-    quantile_level = np.ceil((n + 1) * (1 - alpha)) / n
-    quantile_level = min(quantile_level, 1.0)      # clip to [0, 1]
-    conformal_q = float(np.quantile(scores, quantile_level))
-
-    return conformal_q
-
-
-def predict_with_guarantee(
-    p10_preds:   np.ndarray,
-    p50_preds:   np.ndarray,
-    p90_preds:   np.ndarray,
-    conformal_q: float,
-) -> dict:
-    """
-    Combines TFT quantile outputs with the conformal band.
-
-    Returns both:
-      - Quantile regression P10/P50/P90 (model-calibrated, not guaranteed)
-      - Conformal lower/upper band (mathematically guaranteed 90% coverage)
-    """
-    return {
-        "p10":               p10_preds,
-        "p50":               p50_preds,
-        "p90":               p90_preds,
-        "conf_lower":        np.maximum(0, p50_preds - conformal_q),
-        "conf_upper":        p50_preds + conformal_q,
-        "conformal_q":       conformal_q,
-        "coverage_guarantee": 0.90,
-    }
-
-
-def validate_coverage(
-    conf_lower: np.ndarray,
-    conf_upper: np.ndarray,
-    actuals:    np.ndarray,
-    target:     float = 0.90,
-) -> dict:
-    """
-    Validates empirical coverage on test set.
-    Empirical coverage MUST be >= target (0.90).
-    If it fails, recalibrate with a larger calibration set.
-    """
-    covered   = np.mean((actuals >= conf_lower) & (actuals <= conf_upper))
-    passed    = bool(covered >= target)
-
-    result = {
-        "empirical_coverage": round(float(covered), 4),
-        "target_coverage":    target,
-        "passed":             passed,
-        "gap":                round(float(covered - target), 4),
-    }
-
-    if passed:
-        print(f"  ✓ Coverage validation PASSED: {covered:.1%} >= {target:.0%}")
-    else:
-        print(f"  ✗ Coverage validation FAILED: {covered:.1%} < {target:.0%}")
-        print("    → Increase calibration set size and rerun calibrate_conformal()")
-
-    return result
-
-
-def save_calibration(conformal_q: float, validation_result: dict) -> None:
-    out = {
-        "conformal_q":    conformal_q,
-        "alpha":          0.10,
-        "coverage_target": 0.90,
-        **validation_result,
-    }
-    out_path = OUTPUT_DIR / "conformal_calibration.json"
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"  ✓ Calibration saved: {out_path}")
-
-
-def load_calibration() -> dict:
-    cal_path = OUTPUT_DIR / "conformal_calibration.json"
-    if not cal_path.exists():
-        raise FileNotFoundError("Run models/conformal.py first to generate calibration.")
-    with open(cal_path) as f:
-        return json.load(f)
-
-
-def main():
-    print("OptiCast Conformal Prediction Calibration")
-    print("=" * 40)
-    print("Using synthetic residuals for standalone demonstration.")
-    print("In production: feed real TFT calibration-set predictions.\n")
-
-    np.random.seed(0)
-    n_cal  = 5000
-    n_test = 1000
-
-    # Simulate TFT predictions + actuals (replace with real model outputs)
-    true_gen_cal  = np.random.uniform(0, 800, n_cal)
-    p50_cal       = true_gen_cal + np.random.normal(0, 60, n_cal)
-    p10_cal       = p50_cal - 80
-    p90_cal       = p50_cal + 80
-
-    true_gen_test = np.random.uniform(0, 800, n_test)
-    p50_test      = true_gen_test + np.random.normal(0, 60, n_test)
-    p10_test      = p50_test - 80
-    p90_test      = p50_test + 80
-
-    # Calibrate
-    print("Calibrating on held-out calibration set...")
-    conformal_q = calibrate_conformal(p50_cal, true_gen_cal, alpha=0.10)
-    print(f"  conformal_q = {conformal_q:.2f} MW")
-
-    # Generate guaranteed predictions on test set
-    preds = predict_with_guarantee(p10_test, p50_test, p90_test, conformal_q)
-
-    # Validate
-    print("\nValidating coverage on test set...")
-    val_result = validate_coverage(
-        preds["conf_lower"], preds["conf_upper"], true_gen_test
+    print("2. Rebuilding TimeSeries Rules...")
+    training = TimeSeriesDataSet(
+        train_df, time_idx="time_idx", target="generation_mw", group_ids=["plant_id"],
+        static_categoricals=["asset_type"], 
+        categorical_encoders={"asset_type": NaNLabelEncoder(add_nan=True)},
+        static_reals=["capacity_mw", "latitude", "longitude"],
+        time_varying_known_reals=["ghi", "wind_speed_100m", "temperature_2m", "cloud_cover", "time_of_day", "day_of_week"],
+        time_varying_unknown_reals=["generation_mw"],
+        max_encoder_length=96, max_prediction_length=96,
+        allow_missing_timesteps=True, add_relative_time_idx=True, add_target_scales=True, add_encoder_length=True,
     )
+    
+    cal_dataset = TimeSeriesDataSet.from_dataset(training, cal_df, predict=True, stop_randomization=True)
+    test_dataset = TimeSeriesDataSet.from_dataset(training, test_df, predict=True, stop_randomization=True)
 
-    save_calibration(conformal_q, val_result)
-    print("\n✓ Calibration complete. Run api/main.py to serve predictions.")
+    print("3. Loading Best Model Checkpoint...")
+    best_model_path = max(glob.glob("/content/models/checkpoints/*.ckpt"), key=os.path.getctime)
+    model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
 
+    print("4. Generating Predictions for Calibration Set...")
+    cal_dataloader = cal_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
+    cal_preds = model.predict(cal_dataloader, mode="raw", return_x=True)
+    
+    # FIX: Move target to CPU
+    y_cal_true = cal_preds.x["decoder_target"].cpu()
+    
+    # FIX: Move predictions to CPU
+    cal_prediction_tensor = cal_preds.output[0].cpu() 
+    y_cal_low = cal_prediction_tensor[..., 0]  # 10th percentile
+    y_cal_high = cal_prediction_tensor[..., 2] # 90th percentile
+
+    print("5. Calculating Conformal Scores (CQR)...")
+    # Score = max(lower_bound - actual, actual - upper_bound)
+    scores = torch.maximum(y_cal_low - y_cal_true, y_cal_true - y_cal_high)
+    
+    # Calculate the 90th percentile of the scores to act as our correction factor
+    alpha = 0.1 
+    n = scores.numel()
+    q_val = np.quantile(scores.numpy(), np.ceil((n + 1) * (1 - alpha)) / n)
+    print(f"\n✅ Conformal Correction Factor (q_hat): {q_val:.4f} MW")
+
+    print("\n6. Applying Guaranteed Bounds to Test Set...")
+    test_dataloader = test_dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
+    test_preds = model.predict(test_dataloader, mode="raw", return_x=True)
+    
+    idx = 0
+    # FIX: Move test targets and predictions to CPU before converting to NumPy
+    y_test_true = test_preds.x["decoder_target"][idx].cpu().numpy()
+    test_prediction_tensor = test_preds.output[0].cpu()
+    
+    y_test_median = test_prediction_tensor[idx, :, 1].numpy()
+    y_test_low_raw = test_prediction_tensor[idx, :, 0].numpy()
+    y_test_high_raw = test_prediction_tensor[idx, :, 2].numpy()
+
+    # Apply the calibration factor
+    y_test_low_cal = np.maximum(y_test_low_raw - q_val, 0) # Floor at 0 MW
+    y_test_high_cal = y_test_high_raw + q_val
+
+    print("7. Plotting Final Calibrated Forecast...")
+    plt.figure(figsize=(12, 6))
+    time_steps = np.arange(len(y_test_true))
+    
+    plt.plot(time_steps, y_test_true, label="Actual Generation", color="black", linewidth=2)
+    plt.plot(time_steps, y_test_median, label="TFT Median Forecast", color="blue", linestyle="--")
+    plt.fill_between(time_steps, y_test_low_cal, y_test_high_cal, color="gray", alpha=0.3, label="90% Conformal Bound")
+    
+    plt.title(f"Statistically Guaranteed Forecast (90% Confidence)\nCorrection Factor Applied: ±{q_val:.2f} MW")
+    plt.xlabel("Time Steps (15-min intervals)")
+    plt.ylabel("Generation (MW)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('/content/models/conformal_forecast.png', dpi=300)
+    plt.show()
 
 if __name__ == "__main__":
-    main()
+    run_conformal()
