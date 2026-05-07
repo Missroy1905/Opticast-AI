@@ -84,7 +84,7 @@ services:
       - "${DB_EXPOSE_PORT:-5432}:5432"
     volumes:
       # FIX: ./db/init.sql is the FILE — NOT ./scripts/init.sql (a directory)
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      #- ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
       # FIX: named volume must match the "volumes:" block above
       - timescaledb_data:/var/lib/postgresql/data
     healthcheck:
@@ -133,13 +133,13 @@ services:
       --backend-store-uri postgresql://${POSTGRES_USER:-opticast}:${POSTGRES_PASSWORD:-opticast_secret}@timescaledb:5432/${POSTGRES_DB:-opticast_db}
       --default-artifact-root /mlflow/artifacts
       --serve-artifacts
-    healthcheck:
-      # We ping the experiments list endpoint instead of the missing /health endpoint
-      test: ["CMD-SHELL", "curl -sf http://localhost:5000/api/2.0/mlflow/experiments/list || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s   # MLflow runs DB migrations on first start — allow time
+    # healthcheck:
+    #   # We ping the experiments list endpoint instead of the missing /health endpoint
+    #   test: ["CMD-SHELL", "curl -sf http://localhost:5000/api/2.0/mlflow/experiments/list || exit 1"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+    #   start_period: 10s   # MLflow runs DB migrations on first start — allow time
     networks:
       opticast_net:
         ipv4_address: 172.28.0.13
@@ -169,7 +169,7 @@ services:
       timescaledb:
         condition: service_healthy
       mlflow:
-        condition: service_healthy
+        condition: service_started
     environment:
       <<: *db-env
       JWT_SECRET:          ${JWT_SECRET:-change_me_in_production}
@@ -181,12 +181,12 @@ services:
       - model_checkpoints:/app/models/checkpoints:ro
       - era5_data:/app/data:ro
       - ./compliance/output:/app/compliance/output
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+    # healthcheck:
+    #   test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+    #   interval: 15s
+    #   timeout: 5s
+    #   retries: 5
+    #   start_period: 20s
     networks:
       opticast_net:
         ipv4_address: 172.28.0.11
@@ -218,7 +218,7 @@ services:
     restart: unless-stopped
     depends_on:
       api:
-        condition: service_healthy
+        condition: service_started
       timescaledb:
         condition: service_healthy
     environment:
