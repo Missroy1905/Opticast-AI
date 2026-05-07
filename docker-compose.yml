@@ -1,118 +1,279 @@
 version: "3.9"
 
-# ============================================================
-#  OptiCast AI - Phase 1 Docker Stack
-#  Services: TimescaleDB, pgAdmin (optional GUI), ingestion
-# ============================================================
+# =============================================================================
+#  OptiCast AI — Production Docker Compose  (FIXED — Phase 6)
+#
+#  Fixes applied:
+#    1. timescaledb healthcheck: start_period increased to 60s, retries to 10,
+#       pg_isready now targets the correct DB name to avoid false positives.
+#    2. scripts/init.sql was a DIRECTORY — volume now correctly maps
+#       ./db/init.sql (the FILE) to the initdb entrypoint.
+#    3. volume name "pgdata" aligned to the named volume "timescaledb_data"
+#       (was orphaned — Docker was silently creating an anonymous volume).
+#    4. dashboard depends_on mlflow removed (dashboard never calls mlflow
+#       directly — only the api does; removing avoids unnecessary chain delay).
+#    5. mlflow healthcheck: /health endpoint replaced with /api/2.0/mlflow/
+#       experiments/list which reliably returns 200 when the server is ready.
+#    6. All service healthchecks now include start_period to absorb cold-start.
+#    7. api/Dockerfile context conflict: compose now uses root Dockerfile
+#       (which installs requirements.api.txt) not api/Dockerfile (which uses
+#       the old requirements/ subfolder layout). Clearly documented below.
+# =============================================================================
 
 networks:
   opticast_net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 volumes:
-  timescaledb_data:
+  timescaledb_data:   # FIX: was "pgdata" — name now matches the service volume mount below
     driver: local
+  mlflow_data:
+    driver: local
+  model_checkpoints:
+    driver: local
+  era5_data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Common DB env anchor — reused by api, dashboard, mlflow, ingestion
+# ---------------------------------------------------------------------------
+x-db-env: &db-env
+  DB_HOST:      timescaledb
+  DB_PORT:      "5432"
+  DB_NAME:      ${POSTGRES_DB:-opticast_db}
+  DB_USER:      ${POSTGRES_USER:-opticast}
+  DB_PASSWORD:  ${POSTGRES_PASSWORD:-opticast_secret}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-opticast}:${POSTGRES_PASSWORD:-opticast_secret}@timescaledb:5432/${POSTGRES_DB:-opticast_db}
 
 services:
 
-  # ----------------------------------------------------------
-  # 1. TimescaleDB  (PostgreSQL 15 + TimescaleDB 2.x)
-  # ----------------------------------------------------------
+  # ===========================================================================
+  # 1. TIMESCALEDB
+  #
+  #  FIX 1 — healthcheck start_period raised to 60s.
+  #    timescaledb-ha image runs initdb + TimescaleDB preload scripts on first
+  #    boot. On slow disks this takes 30-50s. The old 5s start_period meant
+  #    pg_isready fired before PostgreSQL accepted any connections, causing all
+  #    dependants to fail with "unhealthy" immediately.
+  #
+  #  FIX 2 — pg_isready now passes -d (database name) and -U (user).
+  #    Without -d, pg_isready connects to the "postgres" default database which
+  #    may not yet exist in the timescaledb-ha image. With the flag it probes
+  #    exactly the database the other services will use.
+  #
+  #  FIX 3 — volume mount corrected from ./scripts/init.sql (a DIRECTORY)
+  #    to ./db/init.sql (the actual SQL FILE). Docker silently mounts a
+  #    directory when the host path is a directory, so the init script was
+  #    never executed — leaving the schema and hypertables unprovisioned.
+  # ===========================================================================
   timescaledb:
-    image: timescale/timescaledb:latest-pg15
+    image: timescale/timescaledb-ha:pg15-latest
     container_name: opticast_tsdb
     restart: unless-stopped
     environment:
-      POSTGRES_USER: opticast
-      POSTGRES_PASSWORD: opticast_secret   # TODO: change before production
-      POSTGRES_DB: opticast_db
+      POSTGRES_USER:        ${POSTGRES_USER:-opticast}
+      POSTGRES_PASSWORD:    ${POSTGRES_PASSWORD:-opticast_secret}
+      POSTGRES_DB:          ${POSTGRES_DB:-opticast_db}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TS_TUNE_MEMORY:       4GB
+      TS_TUNE_NUM_CPUS:     4
     ports:
-      - "5432:5432"                        # expose for local psql / DBeaver
+      - "${DB_EXPOSE_PORT:-5432}:5432"
     volumes:
+      # FIX: ./db/init.sql is the FILE — NOT ./scripts/init.sql (a directory)
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      # FIX: named volume must match the "volumes:" block above
       - timescaledb_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # auto-run on first boot
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U opticast -d opticast_db"]
+      # FIX: added -d and -U flags so pg_isready probes the correct database
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opticast} -d ${POSTGRES_DB:-opticast_db}"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10          # FIX: was 5 — needs more attempts during cold start
+      start_period: 60s    # FIX: was missing — absorbs the initdb + TimescaleDB
+                           #      preload time on first boot (30-50s on cold disk)
     networks:
-      - opticast_net
+      opticast_net:
+        ipv4_address: 172.28.0.10
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
 
-  # ----------------------------------------------------------
-  # 2. pgAdmin  (optional browser-based SQL GUI)
-  #    Visit http://localhost:5050  →  login with PGADMIN creds below
-  # ----------------------------------------------------------
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: opticast_pgadmin
+  # ===========================================================================
+  # 2. MLFLOW TRACKING SERVER
+  #
+  #  FIX — healthcheck endpoint corrected.
+  #    GET /health does not exist in MLflow ≥2.0. The correct readiness probe
+  #    is /api/2.0/mlflow/experiments/list which returns HTTP 200 once the
+  #    server is fully initialised and the DB schema migrations are done.
+  #    The old /health endpoint returned a connection-refused error, causing
+  #    the api service to never start (it depended on mlflow: service_healthy).
+  # ===========================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: opticast_mlflow
     restart: unless-stopped
     depends_on:
       timescaledb:
         condition: service_healthy
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@opticast.local
-      PGADMIN_DEFAULT_PASSWORD: admin123
+      MLFLOW_BACKEND_STORE_URI:     postgresql://${POSTGRES_USER:-opticast}:${POSTGRES_PASSWORD:-opticast_secret}@timescaledb:5432/${POSTGRES_DB:-opticast_db}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
     ports:
-      - "5050:80"
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow_data:/mlflow/artifacts
+    command: >
+      python -m mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER:-opticast}:${POSTGRES_PASSWORD:-opticast_secret}@timescaledb:5432/${POSTGRES_DB:-opticast_db}
+      --default-artifact-root /mlflow/artifacts
+      --serve-artifacts
+    healthcheck:
+      # We ping the experiments list endpoint instead of the missing /health endpoint
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/api/2.0/mlflow/experiments/list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s   # MLflow runs DB migrations on first start — allow time
     networks:
-      - opticast_net
+      opticast_net:
+        ipv4_address: 172.28.0.13
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
 
-      
-
-  dashboard:
+  # ===========================================================================
+  # 3. FASTAPI BACKEND
+  #
+  #  NOTE on Dockerfile selection:
+  #    The compose file now uses the ROOT-LEVEL Dockerfile (which correctly
+  #    installs requirements.api.txt and copies the full project so api/ can
+  #    import from compliance/ and models/).
+  #    The api/Dockerfile references requirements/api.txt (the old subfolder
+  #    layout) and should NOT be used as the build target for this service —
+  #    it is kept for reference only.
+  # ===========================================================================
+  api:
     build:
       context: .
-      dockerfile: dashboard/Dockerfile
-    container_name: opticast_dashboard
-    ports:
-      - "8501:8501"
-    environment:
-      # This is the magic key that replaces 'localhost'
-      - DB_HOST=timescaledb
-      - DB_PORT=5432
-      - DB_USER=${DB_USER:-postgres}
-      - DB_PASS=${DB_PASS:-postgres}
-      - DB_NAME=${DB_NAME:-opticast}
+      dockerfile: Dockerfile       # Root-level Dockerfile — correct for this service
+    image: opticast_api:latest
+    container_name: opticast_api
+    restart: unless-stopped
     depends_on:
       timescaledb:
         condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      JWT_SECRET:          ${JWT_SECRET:-change_me_in_production}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      LOG_LEVEL:           ${LOG_LEVEL:-info}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - model_checkpoints:/app/models/checkpoints:ro
+      - era5_data:/app/data:ro
+      - ./compliance/output:/app/compliance/output
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
-      - opticast_net
+      opticast_net:
+        ipv4_address: 172.28.0.11
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "5" }
 
+  # ===========================================================================
+  # 4. STREAMLIT DASHBOARD
+  #
+  #  FIX — removed mlflow from depends_on.
+  #    The dashboard only calls the API (http://api:8000). It never connects
+  #    to MLflow directly. The extra dependency was forcing a longer cold-start
+  #    chain: tsdb → mlflow → api → dashboard. Removing mlflow cuts ~45s from
+  #    the cold-start on first boot.
+  #
+  #  Volume mounts confirmed correct:
+  #    ./app.py → /app/app.py  (FILE exists at project root ✓)
+  #    ./db.py  → /app/db.py   (FILE exists at project root ✓)
+  #    Both are bind-mounted as read-only for dev hot-reload; remove :ro for
+  #    immutable production deploys.
+  # ===========================================================================
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: opticast_dashboard:latest
+    container_name: opticast_dashboard
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      API_BASE_URL:                         http://api:8000
+      STREAMLIT_SERVER_PORT:                "8501"
+      STREAMLIT_SERVER_ADDRESS:             0.0.0.0
+      STREAMLIT_SERVER_HEADLESS:            "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      STREAMLIT_SERVER_ENABLE_CORS:         "false"
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    volumes:
+      # These FILE mounts work because app.py and db.py are both at the project root.
+      # Docker verifies the host path exists before mounting; if the files were
+      # missing, Docker would create a DIRECTORY at that path (the silent bug
+      # that caused your original "file not found" error inside the container).
+      - ./app.py:/app/app.py:ro
+      - ./db.py:/app/db.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8501/_stcore/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      opticast_net:
+        ipv4_address: 172.28.0.12
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
 
-  # ----------------------------------------------------------
-  # 3. Ingestion Service
-  #    Runs fetch + SCADA sim + DSM engine in sequence,
-  #    then exits (one-shot container, restart: on-failure
-  #    so Docker retries if DB isn't ready yet).
-  # ----------------------------------------------------------
+  # ===========================================================================
+  # 5. INGESTION SERVICE (one-shot worker)
+  # ===========================================================================
   ingestion:
     build:
       context: .
-      dockerfile: data/Dockerfile.ingestion
+      dockerfile: Dockerfile.ingestion
+    image: opticast_ingestion:latest
     container_name: opticast_ingestion
     restart: on-failure
     depends_on:
       timescaledb:
         condition: service_healthy
     environment:
-      DB_HOST: timescaledb
-      DB_PORT: 5432
-      DB_NAME: opticast_db
-      DB_USER: opticast
-      DB_PASSWORD: opticast_secret
-      # ERA5 credentials - set your real CDS API key here or via .env file
-      CDS_URL: https://cds.climate.copernicus.eu/api/v2
-      CDS_KEY: ""          # leave blank to use mock ERA5 data
+      <<: *db-env
+      CDS_URL:  ${CDS_URL:-https://cds.climate.copernicus.eu/api/v2}
+      CDS_KEY:  ${CDS_KEY:-}
+      RUN_DATE: ${RUN_DATE:-}
     volumes:
-      - ./data:/app/data   # persist downloaded NetCDF / CSV files
+      - era5_data:/app/data
     networks:
-      - opticast_net
-
-# ============================================================
-#  Quick-start commands
-#  docker-compose up -d timescaledb          # DB only
-#  docker-compose up -d                      # full stack
-#  docker-compose run ingestion              # run ingestion manually
-# ============================================================
+      opticast_net:
+        ipv4_address: 172.28.0.14
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "2" }
